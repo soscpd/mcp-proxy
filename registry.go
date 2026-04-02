@@ -14,6 +14,13 @@ import (
 
 var validServerName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// toolEntry holds metadata and a dispatch handler for a single namespaced tool.
+type toolEntry struct {
+	Name        string // namespaced: server_name.tool_name
+	Description string
+	Handler     server.ToolHandlerFunc
+}
+
 // registeredServer holds a connected backend MCP server and its tools.
 type registeredServer struct {
 	Name   string
@@ -24,20 +31,39 @@ type registeredServer struct {
 }
 
 // Registry is a thread-safe in-memory registry of backend MCP servers.
-// It manages namespaced tools on a single aggregated MCPServer.
+// It maintains an internal tool catalog used by the mutex layer.
+// Individual tools are NOT exposed on the MCPServer — only the mutex
+// tool is registered there.
 type Registry struct {
-	mu        sync.Mutex
-	servers   map[string]*registeredServer
-	mcpServer *server.MCPServer
-	info      mcp.Implementation
+	mu      sync.Mutex
+	servers map[string]*registeredServer
+	tools   map[string]*toolEntry // namespaced name -> entry
+	info    mcp.Implementation
+
+	// onChange is called (if non-nil) whenever the tool catalog changes.
+	// The mutex layer uses this to trigger notifications.
+	onChange func()
 }
 
-// NewRegistry creates a new registry backed by the given aggregated MCPServer.
-func NewRegistry(mcpServer *server.MCPServer, info mcp.Implementation) *Registry {
+// NewRegistry creates a new registry.
+func NewRegistry(info mcp.Implementation) *Registry {
 	return &Registry{
-		servers:   make(map[string]*registeredServer),
-		mcpServer: mcpServer,
-		info:      info,
+		servers: make(map[string]*registeredServer),
+		tools:   make(map[string]*toolEntry),
+		info:    info,
+	}
+}
+
+// SetOnChange registers a callback invoked after tool catalog mutations.
+func (r *Registry) SetOnChange(fn func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onChange = fn
+}
+
+func (r *Registry) notifyChange() {
+	if r.onChange != nil {
+		r.onChange()
 	}
 }
 
@@ -47,7 +73,7 @@ func namespacedToolName(serverName, toolName string) string {
 }
 
 // Register connects to a backend MCP server, enumerates its tools,
-// and adds them (namespaced) to the aggregated MCPServer.
+// and adds them to the internal catalog.
 // Returns the list of namespaced tool names on success.
 func (r *Registry) Register(ctx context.Context, name string, conf *MCPClientConfigV2) ([]string, error) {
 	if !validServerName.MatchString(name) {
@@ -61,7 +87,6 @@ func (r *Registry) Register(ctx context.Context, name string, conf *MCPClientCon
 		return nil, fmt.Errorf("server %q already registered", name)
 	}
 
-	// Create and initialize the MCP client.
 	mcpClient, err := newMCPClient(name, conf)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client for %q: %w", name, err)
@@ -85,29 +110,24 @@ func (r *Registry) Register(ctx context.Context, name string, conf *MCPClientCon
 	}
 	log.Printf("<%s> Successfully initialized MCP client", name)
 
-	// Enumerate tools from the backend.
 	tools, err := listAllTools(ctx, mcpClient.client)
 	if err != nil {
 		_ = mcpClient.Close()
 		return nil, fmt.Errorf("failed to list tools for %q: %w", name, err)
 	}
 
-	// Add namespaced tools to the aggregated server.
 	nsNames := make([]string, 0, len(tools))
 	for _, tool := range tools {
 		nsName := namespacedToolName(name, tool.Name)
 		nsNames = append(nsNames, nsName)
-		nsTool := tool
-		nsTool.Name = nsName
-		r.mcpServer.AddTools(server.ServerTool{
-			Tool:    nsTool,
-			Handler: makeToolHandler(mcpClient.client, tool.Name),
-		})
+		r.tools[nsName] = &toolEntry{
+			Name:        nsName,
+			Description: tool.Description,
+			Handler:     makeToolHandler(mcpClient.client, tool.Name),
+		}
 		log.Printf("<%s> Added tool %s", name, nsName)
 	}
 
-	// Set up upstream notification handler for tools/list_changed.
-	// Run in a goroutine to avoid deadlock since Register holds r.mu.
 	mcpClient.client.OnNotification(func(notification mcp.JSONRPCNotification) {
 		if notification.Method == mcp.MethodNotificationToolsListChanged {
 			log.Printf("<%s> Received upstream tools/list_changed", name)
@@ -115,7 +135,6 @@ func (r *Registry) Register(ctx context.Context, name string, conf *MCPClientCon
 		}
 	})
 
-	// Create a per-server cancellable context for background goroutines.
 	srvCtx, srvCancel := context.WithCancel(context.Background())
 
 	if mcpClient.needPing {
@@ -131,10 +150,11 @@ func (r *Registry) Register(ctx context.Context, name string, conf *MCPClientCon
 	}
 
 	log.Printf("<%s> Registered with %d tools", name, len(nsNames))
+	r.notifyChange()
 	return nsNames, nil
 }
 
-// Deregister removes a backend server and all its namespaced tools.
+// Deregister removes a backend server and all its tools from the catalog.
 func (r *Registry) Deregister(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -144,16 +164,16 @@ func (r *Registry) Deregister(name string) {
 		return
 	}
 
-	// Remove all namespaced tools.
-	if len(srv.Tools) > 0 {
-		r.mcpServer.DeleteTools(srv.Tools...)
-		log.Printf("<%s> Removed %d tools", name, len(srv.Tools))
+	for _, toolName := range srv.Tools {
+		delete(r.tools, toolName)
 	}
+	log.Printf("<%s> Removed %d tools", name, len(srv.Tools))
 
 	srv.cancel()
 	_ = srv.Client.Close()
 	delete(r.servers, name)
 	log.Printf("<%s> Deregistered", name)
+	r.notifyChange()
 }
 
 // ListServers returns info about all registered servers.
@@ -182,9 +202,38 @@ func (r *Registry) HasServer(name string) bool {
 	return exists
 }
 
-// refreshServerTools re-enumerates tools for a single backend server
-// and updates the aggregated MCPServer. Called when an upstream
-// notifications/tools/list_changed is received.
+// GetAllToolInfo returns name+description for every tool in the catalog.
+func (r *Registry) GetAllToolInfo() []ToolInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	result := make([]ToolInfo, 0, len(r.tools))
+	for _, t := range r.tools {
+		result = append(result, ToolInfo{Name: t.Name, Description: t.Description})
+	}
+	return result
+}
+
+// GetToolHandler returns the dispatch handler for a namespaced tool, or nil.
+func (r *Registry) GetToolHandler(name string) server.ToolHandlerFunc {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if t, ok := r.tools[name]; ok {
+		return t.Handler
+	}
+	return nil
+}
+
+// HasTool checks whether a namespaced tool name exists in the catalog.
+func (r *Registry) HasTool(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.tools[name]
+	return ok
+}
+
+// refreshServerTools re-enumerates tools for a single backend server.
 func (r *Registry) refreshServerTools(ctx context.Context, name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -194,16 +243,15 @@ func (r *Registry) refreshServerTools(ctx context.Context, name string) {
 		return
 	}
 
-	// Remove old tools.
-	if len(srv.Tools) > 0 {
-		r.mcpServer.DeleteTools(srv.Tools...)
+	for _, toolName := range srv.Tools {
+		delete(r.tools, toolName)
 	}
 
-	// Re-enumerate.
 	tools, err := listAllTools(ctx, srv.Client)
 	if err != nil {
 		log.Printf("<%s> Failed to re-enumerate tools: %v", name, err)
 		srv.Tools = nil
+		r.notifyChange()
 		return
 	}
 
@@ -211,15 +259,15 @@ func (r *Registry) refreshServerTools(ctx context.Context, name string) {
 	for _, tool := range tools {
 		nsName := namespacedToolName(name, tool.Name)
 		nsNames = append(nsNames, nsName)
-		nsTool := tool
-		nsTool.Name = nsName
-		r.mcpServer.AddTools(server.ServerTool{
-			Tool:    nsTool,
-			Handler: makeToolHandler(srv.Client, tool.Name),
-		})
+		r.tools[nsName] = &toolEntry{
+			Name:        nsName,
+			Description: tool.Description,
+			Handler:     makeToolHandler(srv.Client, tool.Name),
+		}
 	}
 	srv.Tools = nsNames
 	log.Printf("<%s> Refreshed tools: %d tools", name, len(nsNames))
+	r.notifyChange()
 }
 
 // listAllTools paginates through all tools from a backend client.
@@ -247,7 +295,6 @@ func listAllTools(ctx context.Context, c *client.Client) ([]mcp.Tool, error) {
 // and forwards the call to the correct backend client.
 func makeToolHandler(c *client.Client, originalToolName string) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Rewrite the tool name back to the original.
 		request.Params.Name = originalToolName
 		return c.CallTool(ctx, request)
 	}
@@ -260,4 +307,10 @@ type ServerInfo struct {
 	Command   string `json:"command,omitempty"`
 	ToolCount int    `json:"tool_count"`
 	Connected bool   `json:"connected"`
+}
+
+// ToolInfo is a lightweight view of a tool for discover/reload.
+type ToolInfo struct {
+	Name        string
+	Description string
 }

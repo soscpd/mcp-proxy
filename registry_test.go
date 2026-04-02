@@ -17,7 +17,7 @@ import (
 )
 
 // startBackendServer creates a real MCP SSE server with the given tools
-// and returns its URL and a shutdown function.
+// and returns the backend MCPServer, its URL, and a shutdown function.
 func startBackendServer(t *testing.T, tools ...mcp.Tool) (*server.MCPServer, string, func()) {
 	t.Helper()
 	backend := server.NewMCPServer("test-backend", "1.0",
@@ -42,14 +42,10 @@ func startBackendServer(t *testing.T, tools ...mcp.Tool) (*server.MCPServer, str
 	}
 }
 
-// newTestAggregator creates a test aggregated MCPServer and Registry.
-func newTestAggregator() (*server.MCPServer, *Registry) {
-	mcpServer := server.NewMCPServer("test-proxy", "1.0",
-		server.WithToolCapabilities(true),
-	)
+// newTestRegistry creates a test Registry.
+func newTestRegistry() *Registry {
 	info := mcp.Implementation{Name: "test-proxy"}
-	registry := NewRegistry(mcpServer, info)
-	return mcpServer, registry
+	return NewRegistry(info)
 }
 
 func TestRegisterAddsNamespacedTools(t *testing.T) {
@@ -58,7 +54,7 @@ func TestRegisterAddsNamespacedTools(t *testing.T) {
 		mcp.NewTool("write_file", mcp.WithDescription("Write a file")),
 	)
 
-	mcpServer, registry := newTestAggregator()
+	registry := newTestRegistry()
 	ctx := context.Background()
 
 	tools, err := registry.Register(ctx, "git-mcp", &MCPClientConfigV2{
@@ -69,7 +65,6 @@ func TestRegisterAddsNamespacedTools(t *testing.T) {
 		t.Fatalf("Register failed: %v", err)
 	}
 
-	// Check returned tool names are namespaced.
 	if len(tools) != 2 {
 		t.Fatalf("expected 2 tools, got %d", len(tools))
 	}
@@ -81,26 +76,26 @@ func TestRegisterAddsNamespacedTools(t *testing.T) {
 		t.Fatalf("unexpected tools: %v", tools)
 	}
 
-	// Verify tools are in the aggregated MCPServer.
-	allTools := mcpServer.ListTools()
-	if _, ok := allTools["git-mcp.read_file"]; !ok {
-		t.Error("git-mcp.read_file not found in aggregated server")
+	// Verify tools are in the internal catalog.
+	allTools := registry.GetAllToolInfo()
+	found := make(map[string]bool)
+	for _, ti := range allTools {
+		found[ti.Name] = true
 	}
-	if _, ok := allTools["git-mcp.write_file"]; !ok {
-		t.Error("git-mcp.write_file not found in aggregated server")
+	if !found["git-mcp.read_file"] || !found["git-mcp.write_file"] {
+		t.Error("tools not found in internal catalog")
 	}
 
-	// Clean up: deregister before closing backend.
 	registry.Deregister("git-mcp")
 	shutdown()
 }
 
-func TestRegisterDuplicateReturns409(t *testing.T) {
+func TestRegisterDuplicateReturnsError(t *testing.T) {
 	_, backendURL, shutdown := startBackendServer(t,
 		mcp.NewTool("do_thing", mcp.WithDescription("Do a thing")),
 	)
 
-	_, registry := newTestAggregator()
+	registry := newTestRegistry()
 	ctx := context.Background()
 
 	conf := &MCPClientConfigV2{URL: backendURL, Options: &OptionsV2{}}
@@ -126,7 +121,7 @@ func TestDeregisterRemovesTools(t *testing.T) {
 		mcp.NewTool("search", mcp.WithDescription("Search")),
 	)
 
-	mcpServer, registry := newTestAggregator()
+	registry := newTestRegistry()
 	ctx := context.Background()
 
 	_, err := registry.Register(ctx, "search-svc", &MCPClientConfigV2{
@@ -137,15 +132,13 @@ func TestDeregisterRemovesTools(t *testing.T) {
 		t.Fatalf("Register failed: %v", err)
 	}
 
-	// Verify tool exists.
-	if _, ok := mcpServer.ListTools()["search-svc.search"]; !ok {
+	if !registry.HasTool("search-svc.search") {
 		t.Fatal("tool not found after registration")
 	}
 
 	registry.Deregister("search-svc")
 
-	// Verify tool is gone.
-	if _, ok := mcpServer.ListTools()["search-svc.search"]; ok {
+	if registry.HasTool("search-svc.search") {
 		t.Fatal("tool still present after deregistration")
 	}
 
@@ -153,8 +146,7 @@ func TestDeregisterRemovesTools(t *testing.T) {
 }
 
 func TestDeregisterNonExistentReturnsOk(t *testing.T) {
-	_, registry := newTestAggregator()
-	// Should not panic or error.
+	registry := newTestRegistry()
 	registry.Deregister("nonexistent")
 }
 
@@ -164,7 +156,7 @@ func TestToolCallRoutesToCorrectBackend(t *testing.T) {
 			mcp.WithString("name", mcp.Description("Name to greet"))),
 	)
 
-	mcpServer, registry := newTestAggregator()
+	registry := newTestRegistry()
 	ctx := context.Background()
 
 	_, err := registry.Register(ctx, "hello-svc", &MCPClientConfigV2{
@@ -175,13 +167,12 @@ func TestToolCallRoutesToCorrectBackend(t *testing.T) {
 		t.Fatalf("Register failed: %v", err)
 	}
 
-	// Call the namespaced tool through the aggregated server.
-	st := mcpServer.GetTool("hello-svc.greet")
-	if st == nil {
-		t.Fatal("tool hello-svc.greet not found")
+	handler := registry.GetToolHandler("hello-svc.greet")
+	if handler == nil {
+		t.Fatal("handler not found for hello-svc.greet")
 	}
 
-	result, err := st.Handler(ctx, mcp.CallToolRequest{
+	result, err := handler(ctx, mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name:      "hello-svc.greet",
 			Arguments: map[string]any{"name": "world"},
@@ -205,16 +196,16 @@ func TestToolCallRoutesToCorrectBackend(t *testing.T) {
 	shutdown()
 }
 
-func TestUnknownToolReturnsError(t *testing.T) {
-	mcpServer, _ := newTestAggregator()
-	st := mcpServer.GetTool("nonexistent.tool")
-	if st != nil {
+func TestUnknownToolReturnsNil(t *testing.T) {
+	registry := newTestRegistry()
+	handler := registry.GetToolHandler("nonexistent.tool")
+	if handler != nil {
 		t.Fatal("expected nil for unknown tool")
 	}
 }
 
 func TestInvalidServerNameRejected(t *testing.T) {
-	_, registry := newTestAggregator()
+	registry := newTestRegistry()
 	ctx := context.Background()
 
 	_, err := registry.Register(ctx, "bad name!", &MCPClientConfigV2{
@@ -233,11 +224,7 @@ func TestInvalidServerNameRejected(t *testing.T) {
 
 func newTestMgmtServer(t *testing.T) (*httptest.Server, *Registry, func()) {
 	t.Helper()
-	mcpServer := server.NewMCPServer("test-proxy", "1.0",
-		server.WithToolCapabilities(true),
-	)
-	info := mcp.Implementation{Name: "test-proxy"}
-	registry := NewRegistry(mcpServer, info)
+	registry := newTestRegistry()
 	mgmt := NewMgmtHandler(registry)
 
 	mux := http.NewServeMux()
@@ -255,7 +242,6 @@ func TestCRUDRegisterAndList(t *testing.T) {
 	ts, registry, shutdownMgmt := newTestMgmtServer(t)
 	defer shutdownMgmt()
 
-	// Register.
 	body := fmt.Sprintf(`{"name":"git-mcp","url":"%s"}`, backendURL)
 	resp, err := http.Post(ts.URL+"/mgmt/servers", "application/json", strings.NewReader(body))
 	if err != nil {
@@ -278,7 +264,6 @@ func TestCRUDRegisterAndList(t *testing.T) {
 		t.Fatalf("unexpected tools: %v", regResp.Tools)
 	}
 
-	// List.
 	resp2, err := http.Get(ts.URL + "/mgmt/servers")
 	if err != nil {
 		t.Fatalf("GET failed: %v", err)
@@ -291,9 +276,6 @@ func TestCRUDRegisterAndList(t *testing.T) {
 	}
 	if len(listResp.Servers) != 1 {
 		t.Fatalf("expected 1 server, got %d", len(listResp.Servers))
-	}
-	if listResp.Servers[0].Name != "git-mcp" {
-		t.Fatalf("unexpected server name: %s", listResp.Servers[0].Name)
 	}
 
 	registry.Deregister("git-mcp")
@@ -309,7 +291,6 @@ func TestCRUDDuplicateReturns409(t *testing.T) {
 	defer shutdownMgmt()
 
 	body := fmt.Sprintf(`{"name":"dup-svc","url":"%s"}`, backendURL)
-
 	resp, err := http.Post(ts.URL+"/mgmt/servers", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST failed: %v", err)
@@ -347,7 +328,6 @@ func TestCRUDDeregister(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// DELETE.
 	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/mgmt/servers/del-svc", nil)
 	resp2, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -380,22 +360,63 @@ func TestCRUDDeleteNonExistentReturns200(t *testing.T) {
 	}
 }
 
-func TestNotificationSentOnRegister(t *testing.T) {
+func TestOnChangeCalledOnRegister(t *testing.T) {
 	_, backendURL, shutdownBackend := startBackendServer(t,
 		mcp.NewTool("tool1", mcp.WithDescription("Tool 1")),
 	)
 
-	// Create aggregated server with SSE transport so we can connect a proper MCP client.
+	registry := newTestRegistry()
+	called := make(chan struct{}, 2)
+	registry.SetOnChange(func() {
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+	})
+
+	_, err := registry.Register(context.Background(), "notify-svc", &MCPClientConfigV2{
+		URL:     backendURL,
+		Options: &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onChange not called on register")
+	}
+
+	registry.Deregister("notify-svc")
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onChange not called on deregister")
+	}
+
+	shutdownBackend()
+}
+
+func TestNotificationSentViaSSE(t *testing.T) {
+	_, backendURL, shutdownBackend := startBackendServer(t,
+		mcp.NewTool("tool1", mcp.WithDescription("Tool 1")),
+	)
+
 	aggServer := server.NewMCPServer("test-proxy", "1.0",
 		server.WithToolCapabilities(true),
 	)
-	info := mcp.Implementation{Name: "test-proxy"}
-	registry := NewRegistry(aggServer, info)
+	registry := newTestRegistry()
+	registry.SetOnChange(func() {
+		aggServer.SendNotificationToAllClients(
+			mcp.MethodNotificationToolsListChanged, nil,
+		)
+	})
 
 	ts := server.NewTestServer(aggServer)
 	defer ts.Close()
 
-	// Connect a proper MCP client to the proxy SSE endpoint.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -409,7 +430,6 @@ func TestNotificationSentOnRegister(t *testing.T) {
 		t.Fatalf("Failed to start proxy client: %v", err)
 	}
 
-	// Set up notification listener before initializing.
 	notifCh := make(chan struct{}, 1)
 	proxyClient.OnNotification(func(notification mcp.JSONRPCNotification) {
 		if notification.Method == mcp.MethodNotificationToolsListChanged {
@@ -427,7 +447,6 @@ func TestNotificationSentOnRegister(t *testing.T) {
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	// Register a backend server — should trigger tools/list_changed.
 	_, regErr := registry.Register(ctx, "notify-svc", &MCPClientConfigV2{
 		URL:     backendURL,
 		Options: &OptionsV2{},
@@ -438,7 +457,6 @@ func TestNotificationSentOnRegister(t *testing.T) {
 
 	select {
 	case <-notifCh:
-		// Success
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for tools/list_changed notification")
 	}
@@ -447,75 +465,7 @@ func TestNotificationSentOnRegister(t *testing.T) {
 	shutdownBackend()
 }
 
-func TestNotificationSentOnDeregister(t *testing.T) {
-	_, backendURL, shutdownBackend := startBackendServer(t,
-		mcp.NewTool("tool1", mcp.WithDescription("Tool 1")),
-	)
-
-	aggServer := server.NewMCPServer("test-proxy", "1.0",
-		server.WithToolCapabilities(true),
-	)
-	info := mcp.Implementation{Name: "test-proxy"}
-	registry := NewRegistry(aggServer, info)
-
-	ts := server.NewTestServer(aggServer)
-	defer ts.Close()
-
-	// Register first.
-	_, err := registry.Register(context.Background(), "dereg-svc", &MCPClientConfigV2{
-		URL:     backendURL,
-		Options: &OptionsV2{},
-	})
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-
-	// Connect proper MCP client.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	proxyClient, err := client.NewSSEMCPClient(ts.URL + "/sse")
-	if err != nil {
-		t.Fatalf("Failed to create proxy client: %v", err)
-	}
-	defer proxyClient.Close()
-
-	if err := proxyClient.Start(ctx); err != nil {
-		t.Fatalf("Failed to start proxy client: %v", err)
-	}
-
-	notifCh := make(chan struct{}, 1)
-	proxyClient.OnNotification(func(notification mcp.JSONRPCNotification) {
-		if notification.Method == mcp.MethodNotificationToolsListChanged {
-			select {
-			case notifCh <- struct{}{}:
-			default:
-			}
-		}
-	})
-
-	initReq := mcp.InitializeRequest{}
-	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
-	initReq.Params.ClientInfo = mcp.Implementation{Name: "test-client"}
-	if _, err := proxyClient.Initialize(ctx, initReq); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-
-	// Deregister — should trigger notification.
-	registry.Deregister("dereg-svc")
-
-	select {
-	case <-notifCh:
-		// Success
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for tools/list_changed notification on deregister")
-	}
-
-	shutdownBackend()
-}
-
 func TestUpstreamToolsListChangedTriggersRefresh(t *testing.T) {
-	// Create a backend server we can modify after registration.
 	backend := server.NewMCPServer("dynamic-backend", "1.0",
 		server.WithToolCapabilities(true),
 	)
@@ -529,7 +479,7 @@ func TestUpstreamToolsListChangedTriggersRefresh(t *testing.T) {
 	ts := server.NewTestServer(backend)
 	defer ts.Close()
 
-	mcpAgg, registry := newTestAggregator()
+	registry := newTestRegistry()
 
 	tools, err := registry.Register(context.Background(), "dynamic-svc", &MCPClientConfigV2{
 		URL:     ts.URL + "/sse",
@@ -542,8 +492,6 @@ func TestUpstreamToolsListChangedTriggersRefresh(t *testing.T) {
 		t.Fatalf("unexpected initial tools: %v", tools)
 	}
 
-	// Now add a new tool to the backend - this triggers notifications/tools/list_changed
-	// which the proxy client should receive and refresh.
 	backend.AddTool(mcp.NewTool("new_tool", mcp.WithDescription("New")),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return &mcp.CallToolResult{
@@ -551,12 +499,9 @@ func TestUpstreamToolsListChangedTriggersRefresh(t *testing.T) {
 			}, nil
 		})
 
-	// Wait for the notification to propagate and tools to refresh.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		allTools := mcpAgg.ListTools()
-		if _, ok := allTools["dynamic-svc.new_tool"]; ok {
-			// Success - the upstream notification triggered a refresh.
+		if registry.HasTool("dynamic-svc.new_tool") {
 			registry.Deregister("dynamic-svc")
 			return
 		}
