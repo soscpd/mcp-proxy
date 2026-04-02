@@ -77,7 +77,7 @@ func startHTTPServer(config *Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create a single aggregated MCPServer with tool change notifications enabled.
+	// Create a single aggregated MCPServer.
 	serverOpts := []server.ServerOption{
 		server.WithResourceCapabilities(true, true),
 		server.WithRecovery(),
@@ -97,7 +97,23 @@ func startHTTPServer(config *Config) error {
 		Name: config.McpProxy.Name,
 	}
 
-	registry := NewRegistry(mcpServer, info)
+	registry := NewRegistry(info)
+
+	// Create job queue and mutex tool.
+	queue := NewJobQueue(registry, 1*time.Hour)
+	mutexTool := NewMutexTool(registry, queue)
+
+	// Register mutex as the ONLY tool exposed to clients.
+	mcpServer.AddTool(mutexTool.Tool(), mutexTool.Handler())
+
+	// When the internal tool catalog changes, notify connected clients
+	// so they re-fetch tools/list (which still returns just "mutex",
+	// but the model can use reload to see updated handlers).
+	registry.SetOnChange(func() {
+		mcpServer.SendNotificationToAllClients(
+			mcp.MethodNotificationToolsListChanged, nil,
+		)
+	})
 
 	// Create the MCP protocol handler (SSE or Streamable HTTP).
 	var mcpHandler http.Handler
@@ -116,7 +132,7 @@ func startHTTPServer(config *Config) error {
 		return fmt.Errorf("unknown server type: %s", config.McpProxy.Type)
 	}
 
-	// Build middleware chain for the MCP endpoint.
+	// Middleware chain.
 	middlewares := []MiddlewareFunc{
 		recoverMiddleware("mcp"),
 	}
@@ -130,11 +146,8 @@ func startHTTPServer(config *Config) error {
 	}
 
 	httpMux := http.NewServeMux()
-
-	// Mount the MCP protocol endpoint.
 	httpMux.Handle("/", chainMiddleware(mcpHandler, middlewares...))
 
-	// Mount the management API.
 	mgmtHandler := NewMgmtHandler(registry)
 	httpMux.Handle("/mgmt/servers", mgmtHandler)
 	httpMux.Handle("/mgmt/servers/", mgmtHandler)
