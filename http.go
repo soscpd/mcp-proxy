@@ -100,7 +100,9 @@ func startHTTPServer(config *Config) error {
 	registry := NewRegistry(info)
 
 	// Create job queue and mutex tool.
-	queue := NewJobQueue(registry, 1*time.Hour)
+	// maxJobsPerSession defaults to 64; configurable via config if needed.
+	maxJobs := 64
+	queue := NewJobQueue(registry, 1*time.Hour, maxJobs)
 	mutexTool := NewMutexTool(registry, queue)
 
 	// Register mutex as the ONLY tool exposed to clients.
@@ -151,6 +153,9 @@ func startHTTPServer(config *Config) error {
 	mgmtHandler := NewMgmtHandler(registry)
 	httpMux.Handle("/mgmt/servers", mgmtHandler)
 	httpMux.Handle("/mgmt/servers/", mgmtHandler)
+
+	metricsHandler := NewMetricsHandler(queue, registry)
+	httpMux.Handle("/mgmt/metrics", metricsHandler)
 
 	httpServer := &http.Server{
 		Addr:    config.McpProxy.Addr,

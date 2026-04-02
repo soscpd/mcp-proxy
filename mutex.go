@@ -144,7 +144,10 @@ func (m *MutexTool) handleDispatch(ctx context.Context, sessionID string, mr mut
 		return respond("dispatch", false, nil, "handler not found")
 	}
 
-	job := m.queue.Dispatch(ctx, sessionID, resolvedHandler, resolvedArgs)
+	job, err := m.queue.Dispatch(ctx, sessionID, resolvedHandler, resolvedArgs)
+	if err != nil {
+		return respond("dispatch", false, nil, err.Error())
+	}
 
 	return respond("dispatch", true, map[string]any{
 		"job_id":  job.ID,

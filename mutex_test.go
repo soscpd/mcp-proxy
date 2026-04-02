@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +31,7 @@ func newTestMutex(t *testing.T) (*MutexTool, *Registry, func()) {
 		t.Fatalf("Register failed: %v", err)
 	}
 
-	queue := NewJobQueue(registry, 1*time.Hour)
+	queue := NewJobQueue(registry, 1*time.Hour, 0)
 	mutex := NewMutexTool(registry, queue)
 
 	return mutex, registry, func() {
@@ -232,7 +235,7 @@ func TestStatusFailed(t *testing.T) {
 	}
 	defer registry.Deregister("err-svc")
 
-	queue := NewJobQueue(registry, 1*time.Hour)
+	queue := NewJobQueue(registry, 1*time.Hour, 0)
 	mutex := NewMutexTool(registry, queue)
 
 	dispResp := callMutex(t, mutex, map[string]any{
@@ -284,7 +287,7 @@ func TestStatusRunning(t *testing.T) {
 		shutdown()
 	}()
 
-	queue := NewJobQueue(registry, 1*time.Hour)
+	queue := NewJobQueue(registry, 1*time.Hour, 0)
 	mutex := NewMutexTool(registry, queue)
 
 	dispResp := callMutex(t, mutex, map[string]any{
@@ -378,9 +381,9 @@ func TestFetchCrossSessionDenied(t *testing.T) {
 	}
 	defer registry.Deregister("svc1")
 
-	queue := NewJobQueue(registry, 1*time.Hour)
+	queue := NewJobQueue(registry, 1*time.Hour, 0)
 
-	job := queue.Dispatch(context.Background(), "s1", "svc1.tool1", nil)
+	job, _ := queue.Dispatch(context.Background(), "s1", "svc1.tool1", nil)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -466,8 +469,8 @@ func TestExpiredChunkNotReturned(t *testing.T) {
 	}
 	defer registry.Deregister("svc1")
 
-	queue := NewJobQueue(registry, 100*time.Millisecond)
-	job := queue.Dispatch(context.Background(), "s1", "svc1.tool1", nil)
+	queue := NewJobQueue(registry, 100*time.Millisecond, 0)
+	job, _ := queue.Dispatch(context.Background(), "s1", "svc1.tool1", nil)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -530,5 +533,162 @@ func TestJobCallsCorrectBackend(t *testing.T) {
 	content := fetchResp.Data.(map[string]any)["content"].(string)
 	if content != "called clone" {
 		t.Fatalf("expected 'called clone', got %q", content)
+	}
+}
+
+// --- session job limit tests ---
+
+func TestDispatchRejectsWhenSessionLimitReached(t *testing.T) {
+	// Create a slow backend so jobs stay active.
+	backend, backendURL, shutdown := startBackendServer(t,
+		mcp.NewTool("slow", mcp.WithDescription("Slow")),
+	)
+	backend.DeleteTools("slow")
+	backend.AddTool(mcp.NewTool("slow", mcp.WithDescription("Slow")),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			time.Sleep(5 * time.Second)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{mcp.TextContent{Type: "text", Text: "done"}},
+			}, nil
+		})
+	defer shutdown()
+
+	registry := newTestRegistry()
+	_, err := registry.Register(context.Background(), "slow-svc", &MCPClientConfigV2{
+		URL: backendURL, Options: &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	defer registry.Deregister("slow-svc")
+
+	// Limit to 2 active jobs per session.
+	queue := NewJobQueue(registry, 1*time.Hour, 2)
+	mutex := NewMutexTool(registry, queue)
+
+	// Fill the limit.
+	for i := 0; i < 2; i++ {
+		resp := callMutex(t, mutex, map[string]any{
+			"mode":    "dispatch",
+			"handler": "slow-svc.slow",
+		})
+		if !resp.OK {
+			t.Fatalf("dispatch %d failed: %s", i, resp.Error)
+		}
+	}
+
+	// Wait for jobs to start running.
+	time.Sleep(200 * time.Millisecond)
+
+	// Third dispatch should be rejected.
+	resp := callMutex(t, mutex, map[string]any{
+		"mode":    "dispatch",
+		"handler": "slow-svc.slow",
+	})
+	if resp.OK {
+		t.Fatal("expected dispatch to be rejected when session limit reached")
+	}
+	if resp.Error != "session job limit reached" {
+		t.Fatalf("unexpected error: %s", resp.Error)
+	}
+}
+
+// --- metrics tests ---
+
+func TestMetricsReturnsQueueState(t *testing.T) {
+	_, backendURL, shutdown := startBackendServer(t,
+		mcp.NewTool("tool1", mcp.WithDescription("Tool 1")),
+	)
+	defer shutdown()
+
+	registry := newTestRegistry()
+	_, err := registry.Register(context.Background(), "svc1", &MCPClientConfigV2{
+		URL: backendURL, Options: &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	defer registry.Deregister("svc1")
+
+	queue := NewJobQueue(registry, 1*time.Hour, 10)
+
+	// Dispatch a job and wait for completion.
+	job, _ := queue.Dispatch(context.Background(), "s1", "svc1.tool1", nil)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		j := queue.GetJob("s1", job.ID)
+		if j != nil && j.Status == JobStatusDone {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	m := queue.Metrics()
+
+	if m.Sessions != 1 {
+		t.Fatalf("expected 1 session, got %d", m.Sessions)
+	}
+	if m.MaxJobsPerSession != 10 {
+		t.Fatalf("expected max 10, got %d", m.MaxJobsPerSession)
+	}
+	if m.JobsByStatus[JobStatusDone] != 1 {
+		t.Fatalf("expected 1 done job, got %d", m.JobsByStatus[JobStatusDone])
+	}
+	if m.Chunks != 1 {
+		t.Fatalf("expected 1 chunk, got %d", m.Chunks)
+	}
+}
+
+func TestMetricsHTTPEndpoint(t *testing.T) {
+	_, backendURL, shutdown := startBackendServer(t,
+		mcp.NewTool("tool1", mcp.WithDescription("Tool 1")),
+	)
+	defer shutdown()
+
+	registry := newTestRegistry()
+	_, err := registry.Register(context.Background(), "svc1", &MCPClientConfigV2{
+		URL: backendURL, Options: &OptionsV2{},
+	})
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	defer registry.Deregister("svc1")
+
+	queue := NewJobQueue(registry, 1*time.Hour, 10)
+	handler := NewMetricsHandler(queue, registry)
+
+	// Prometheus format.
+	req, _ := http.NewRequest("GET", "/mgmt/metrics", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "mcpeto_sessions_total") {
+		t.Fatal("expected mcpeto_sessions_total in prometheus output")
+	}
+	if !strings.Contains(body, "mcpeto_jobs_per_session_limit") {
+		t.Fatal("expected mcpeto_jobs_per_session_limit in prometheus output")
+	}
+	if !strings.Contains(body, "mcpeto_handlers_total") {
+		t.Fatal("expected mcpeto_handlers_total in prometheus output")
+	}
+
+	// JSON format.
+	req2, _ := http.NewRequest("GET", "/mgmt/metrics?format=json", nil)
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+
+	if rr2.Code != 200 {
+		t.Fatalf("expected 200, got %d", rr2.Code)
+	}
+	var jsonResp map[string]any
+	if err := json.NewDecoder(rr2.Body).Decode(&jsonResp); err != nil {
+		t.Fatalf("failed to decode JSON: %v", err)
+	}
+	if jsonResp["max_jobs_per_session"] != float64(10) {
+		t.Fatalf("expected max_jobs_per_session=10, got %v", jsonResp["max_jobs_per_session"])
 	}
 }

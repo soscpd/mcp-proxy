@@ -63,25 +63,27 @@ type Alias struct {
 
 // JobQueue manages jobs, chunks, and sessions.
 type JobQueue struct {
-	mu       sync.Mutex
-	jobs     map[string]*Job
-	chunks   map[string]*Chunk
-	sessions map[string]*Session
-	registry *Registry
-	chunkTTL time.Duration
+	mu               sync.Mutex
+	jobs             map[string]*Job
+	chunks           map[string]*Chunk
+	sessions         map[string]*Session
+	registry         *Registry
+	chunkTTL         time.Duration
+	maxJobsPerSession int // 0 = unlimited
 }
 
 // NewJobQueue creates a new job queue backed by the given registry.
-func NewJobQueue(registry *Registry, chunkTTL time.Duration) *JobQueue {
+func NewJobQueue(registry *Registry, chunkTTL time.Duration, maxJobsPerSession int) *JobQueue {
 	if chunkTTL == 0 {
 		chunkTTL = 1 * time.Hour
 	}
 	return &JobQueue{
-		jobs:     make(map[string]*Job),
-		chunks:   make(map[string]*Chunk),
-		sessions: make(map[string]*Session),
-		registry: registry,
-		chunkTTL: chunkTTL,
+		jobs:              make(map[string]*Job),
+		chunks:            make(map[string]*Chunk),
+		sessions:          make(map[string]*Session),
+		registry:          registry,
+		chunkTTL:          chunkTTL,
+		maxJobsPerSession: maxJobsPerSession,
 	}
 }
 
@@ -98,12 +100,30 @@ func (q *JobQueue) getOrCreateSession(sessionID string) *Session {
 	return s
 }
 
+// ErrSessionJobLimit is returned when a session exceeds its job queue limit.
+var ErrSessionJobLimit = errStr("session job limit reached")
+
 // Dispatch enqueues a job and starts a worker goroutine.
-// Returns the Job immediately with status "queued".
-func (q *JobQueue) Dispatch(ctx context.Context, sessionID, handler string, args map[string]any) *Job {
+// Returns the Job immediately with status "queued", or an error if
+// the session has reached its active job limit.
+func (q *JobQueue) Dispatch(ctx context.Context, sessionID, handler string, args map[string]any) (*Job, error) {
 	q.mu.Lock()
 
 	_ = q.getOrCreateSession(sessionID)
+
+	// Enforce per-session limit on active (queued + running) jobs.
+	if q.maxJobsPerSession > 0 {
+		active := 0
+		for _, j := range q.jobs {
+			if j.SessionID == sessionID && (j.Status == JobStatusQueued || j.Status == JobStatusRunning) {
+				active++
+			}
+		}
+		if active >= q.maxJobsPerSession {
+			q.mu.Unlock()
+			return nil, ErrSessionJobLimit
+		}
+	}
 
 	job := &Job{
 		ID:        genID("j"),
@@ -117,7 +137,7 @@ func (q *JobQueue) Dispatch(ctx context.Context, sessionID, handler string, args
 	q.mu.Unlock()
 
 	go q.runJob(ctx, job)
-	return job
+	return job, nil
 }
 
 // runJob executes the tool call and writes the result.
@@ -249,6 +269,58 @@ func (q *JobQueue) GetSessionAliasCount(sessionID string) int {
 		return 0
 	}
 	return len(sess.Aliases)
+}
+
+// QueueMetrics holds point-in-time metrics for the job queue.
+type QueueMetrics struct {
+	Sessions           int            `json:"sessions"`
+	MaxJobsPerSession  int            `json:"max_jobs_per_session"`
+	JobsByStatus       map[string]int `json:"jobs_by_status"`
+	ActiveJobs         int            `json:"active_jobs"`          // queued + running
+	PeakSessionActive  int            `json:"peak_session_active"`  // highest active count across sessions
+	Chunks             int            `json:"chunks"`
+	ChunksExpired      int            `json:"chunks_expired"`       // cleaned up this call
+}
+
+// Metrics computes and returns a snapshot of queue state.
+// It also lazily cleans up expired chunks.
+func (q *JobQueue) Metrics() QueueMetrics {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	m := QueueMetrics{
+		Sessions:          len(q.sessions),
+		MaxJobsPerSession: q.maxJobsPerSession,
+		JobsByStatus:      make(map[string]int),
+	}
+
+	// Count jobs by status and active jobs per session.
+	sessionActive := make(map[string]int)
+	for _, j := range q.jobs {
+		m.JobsByStatus[j.Status]++
+		if j.Status == JobStatusQueued || j.Status == JobStatusRunning {
+			m.ActiveJobs++
+			sessionActive[j.SessionID]++
+		}
+	}
+	for _, count := range sessionActive {
+		if count > m.PeakSessionActive {
+			m.PeakSessionActive = count
+		}
+	}
+
+	// Count chunks and clean expired.
+	expired := 0
+	for id, c := range q.chunks {
+		if c.IsExpired() {
+			delete(q.chunks, id)
+			expired++
+		}
+	}
+	m.Chunks = len(q.chunks)
+	m.ChunksExpired = expired
+
+	return m
 }
 
 // --- helpers ---
