@@ -1,0 +1,60 @@
+replicaCount: 1
+
+image:
+  repository: registry.skull.everyof.net/mcpeto
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 9090
+
+# MCP proxy config injected as a ConfigMap and mounted at /config/config.json.
+config:
+  mcpProxy:
+    baseURL: "http://mcpeto:9090"
+    addr: ":9090"
+    name: "mcpeto"
+    version: "1.0.0"
+    type: "sse"
+    options:
+      panicIfInvalid: false
+      logEnabled: true
+      authTokens: []
+  mcpServers: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  # Scale on the Prometheus metric exposed at /mgmt/metrics.
+  # mcpeto_jobs_per_session_peak / mcpeto_jobs_per_session_limit
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: mcpeto_jobs_per_session_peak
+        target:
+          type: AverageValue
+          averageValue: "48"
+
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  path: /mgmt/metrics
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+podLabels: {}

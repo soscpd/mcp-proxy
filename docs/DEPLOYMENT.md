@@ -8,14 +8,14 @@ Run with a local config file mounted into the container:
 docker run -d \
   -p 9090:9090 \
   -v /path/to/config.json:/config/config.json \
-  ghcr.io/tbxark/mcp-proxy:latest
+  registry.skull.everyof.net/mcpeto:latest
 ```
 
 Or reference a remote config URL:
 
 ```bash
 docker run -d -p 9090:9090 \
-  ghcr.io/tbxark/mcp-proxy:latest \
+  registry.skull.everyof.net/mcpeto:latest \
   --config https://example.com/config.json
 ```
 
@@ -28,7 +28,7 @@ Minimal compose file:
 ```yaml
 services:
   app:
-    image: ghcr.io/tbxark/mcp-proxy:latest
+    image: registry.skull.everyof.net/mcpeto:latest
     pull_policy: always
     volumes:
       - ./config.json:/config/config.json
@@ -51,7 +51,7 @@ services:
     command: ["caddy", "file-server", "--root", "/config"]
 
   app:
-    image: ghcr.io/tbxark/mcp-proxy:latest
+    image: registry.skull.everyof.net/mcpeto:latest
     pull_policy: always
     ports:
       - "9090:9090"

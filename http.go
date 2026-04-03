@@ -3,17 +3,17 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -74,70 +74,112 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 }
 
 func startHTTPServer(config *Config) error {
-	baseURL, uErr := url.Parse(config.McpProxy.BaseURL)
-	if uErr != nil {
-		return uErr
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var errorGroup errgroup.Group
-	httpMux := http.NewServeMux()
-	httpServer := &http.Server{
-		Addr:    config.McpProxy.Addr,
-		Handler: httpMux,
+	// Create a single aggregated MCPServer.
+	serverOpts := []server.ServerOption{
+		server.WithResourceCapabilities(true, true),
+		server.WithRecovery(),
+		server.WithToolCapabilities(true),
 	}
+	if config.McpProxy.Options != nil && config.McpProxy.Options.LogEnabled.OrElse(false) {
+		serverOpts = append(serverOpts, server.WithLogging())
+	}
+
+	mcpServer := server.NewMCPServer(
+		config.McpProxy.Name,
+		config.McpProxy.Version,
+		serverOpts...,
+	)
+
 	info := mcp.Implementation{
 		Name: config.McpProxy.Name,
 	}
 
+	registry := NewRegistry(info)
+
+	// Create job queue and mutex tool.
+	// maxJobsPerSession defaults to 64; configurable via config if needed.
+	maxJobs := 64
+	queue := NewJobQueue(registry, 1*time.Hour, maxJobs)
+	mutexTool := NewMutexTool(registry, queue)
+
+	// Register mutex as the ONLY tool exposed to clients.
+	mcpServer.AddTool(mutexTool.Tool(), mutexTool.Handler())
+
+	// When the internal tool catalog changes, notify connected clients
+	// so they re-fetch tools/list (which still returns just "mutex",
+	// but the model can use reload to see updated handlers).
+	registry.SetOnChange(func() {
+		mcpServer.SendNotificationToAllClients(
+			mcp.MethodNotificationToolsListChanged, nil,
+		)
+	})
+
+	// Create the MCP protocol handler (SSE or Streamable HTTP).
+	var mcpHandler http.Handler
+	switch config.McpProxy.Type {
+	case MCPServerTypeSSE:
+		mcpHandler = server.NewSSEServer(
+			mcpServer,
+			server.WithBaseURL(config.McpProxy.BaseURL),
+		)
+	case MCPServerTypeStreamable:
+		mcpHandler = server.NewStreamableHTTPServer(
+			mcpServer,
+			server.WithStateLess(true),
+		)
+	default:
+		return fmt.Errorf("unknown server type: %s", config.McpProxy.Type)
+	}
+
+	// Middleware chain.
+	middlewares := []MiddlewareFunc{
+		recoverMiddleware("mcp"),
+	}
+	if config.McpProxy.Options != nil {
+		if config.McpProxy.Options.LogEnabled.OrElse(false) {
+			middlewares = append(middlewares, loggerMiddleware("mcp"))
+		}
+		if len(config.McpProxy.Options.AuthTokens) > 0 {
+			middlewares = append(middlewares, newAuthMiddleware(config.McpProxy.Options.AuthTokens))
+		}
+	}
+
+	httpMux := http.NewServeMux()
+	httpMux.Handle("/", chainMiddleware(mcpHandler, middlewares...))
+
+	mgmtHandler := NewMgmtHandler(registry)
+	httpMux.Handle("/mgmt/servers", mgmtHandler)
+	httpMux.Handle("/mgmt/servers/", mgmtHandler)
+
+	metricsHandler := NewMetricsHandler(queue, registry)
+	httpMux.Handle("/mgmt/metrics", metricsHandler)
+
+	httpServer := &http.Server{
+		Addr:    config.McpProxy.Addr,
+		Handler: httpMux,
+	}
+
+	// Register servers from config concurrently.
+	var errorGroup errgroup.Group
 	for name, clientConfig := range config.McpServers {
-		if clientConfig.Options.Disabled {
+		if clientConfig.Options != nil && clientConfig.Options.Disabled {
 			log.Printf("<%s> Disabled", name)
 			continue
 		}
-		mcpClient, err := newMCPClient(name, clientConfig)
-		if err != nil {
-			return err
-		}
-		server, err := newMCPServer(name, config.McpProxy, clientConfig)
-		if err != nil {
-			return err
-		}
 		errorGroup.Go(func() error {
 			log.Printf("<%s> Connecting", name)
-			addErr := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
-			if addErr != nil {
-				log.Printf("<%s> Failed to add client to server: %v", name, addErr)
-				if clientConfig.Options.PanicIfInvalid.OrElse(false) {
-					return addErr
+			_, regErr := registry.Register(ctx, name, clientConfig)
+			if regErr != nil {
+				log.Printf("<%s> Failed to register: %v", name, regErr)
+				if clientConfig.Options != nil && clientConfig.Options.PanicIfInvalid.OrElse(false) {
+					return regErr
 				}
 				return nil
 			}
 			log.Printf("<%s> Connected", name)
-
-			middlewares := make([]MiddlewareFunc, 0)
-			middlewares = append(middlewares, recoverMiddleware(name))
-			if clientConfig.Options.LogEnabled.OrElse(false) {
-				middlewares = append(middlewares, loggerMiddleware(name))
-			}
-			if len(clientConfig.Options.AuthTokens) > 0 {
-				middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
-			}
-			mcpRoute := path.Join(baseURL.Path, name)
-			if !strings.HasPrefix(mcpRoute, "/") {
-				mcpRoute = "/" + mcpRoute
-			}
-			if !strings.HasSuffix(mcpRoute, "/") {
-				mcpRoute += "/"
-			}
-			log.Printf("<%s> Handling requests at %s", name, mcpRoute)
-			httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
-			httpServer.RegisterOnShutdown(func() {
-				log.Printf("<%s> Shutting down", name)
-				_ = mcpClient.Close()
-			})
 			return nil
 		})
 	}
@@ -145,7 +187,7 @@ func startHTTPServer(config *Config) error {
 	go func() {
 		err := errorGroup.Wait()
 		if err != nil {
-			log.Fatalf("Failed to add clients: %v", err)
+			log.Fatalf("Failed to register clients: %v", err)
 		}
 		log.Printf("All clients initialized")
 	}()

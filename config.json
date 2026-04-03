@@ -2,7 +2,7 @@
   "mcpProxy": {
     "baseURL": "https://mcp.example.com",
     "addr": ":9090",
-    "name": "MCP Proxy",
+    "name": "mcpeto",
     "version": "1.0.0",
     "type": "streamable-http",
     "options": {
