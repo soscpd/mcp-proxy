@@ -1,4 +1,4 @@
-module github.com/tbxark/mcp-proxy
+module github.com/soscpd/mcpeto
 
 go 1.24.0
 

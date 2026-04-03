@@ -6,7 +6,7 @@ RUN go mod download
 COPY . .
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build \
     -ldflags "-X main.BuildVersion=$(git rev-parse --short HEAD 2>/dev/null || echo dev)" \
-    -o /app/build/mcp-proxy ./...
+    -o /app/build/mcpeto ./...
 
 FROM node:lts-bookworm-slim AS node
 
@@ -22,6 +22,6 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/build/mcp-proxy /main
+COPY --from=builder /app/build/mcpeto /main
 ENTRYPOINT ["/main"]
 CMD ["--config", "/config/config.json"]

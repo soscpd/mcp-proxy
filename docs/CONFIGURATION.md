@@ -2,7 +2,7 @@
 
 This project supports a v2 JSON configuration. v1 configs are automatically migrated at load time.
 
-- Online converter (build Claude config from your proxy): https://tbxark.github.io/mcp-proxy
+- See also: [dynamic-registration.md](dynamic-registration.md) for the runtime registration API.
 
 ## Full Example
 
@@ -11,7 +11,7 @@ This project supports a v2 JSON configuration. v1 configs are automatically migr
   "mcpProxy": {
     "baseURL": "https://mcp.example.com",
     "addr": ":9090",
-    "name": "MCP Proxy",
+    "name": "mcpeto",
     "version": "1.0.0",
     "type": "streamable-http", // or "sse" (default)
     "options": {

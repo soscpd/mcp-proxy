@@ -1,64 +1,88 @@
-# MCP Proxy Server
+# mcpeto
 
-An MCP proxy that aggregates multiple MCP servers behind a single HTTP entrypoint.
+MCP tool aggregator with a single-tool interface. Proxies multiple MCP backend
+servers behind one endpoint, exposing a unified `mutex` tool that handles
+discovery, async dispatch, result retrieval, aliasing, and handler reload.
 
-## Features
+Built for environments where an LLM agent (e.g. nanobot) needs access to a
+fleet of MCP servers without seeing hundreds of individual tool schemas.
 
-- Proxy multiple MCP clients: aggregate tools, prompts, and resources from many servers.
-- SSE and streamable HTTP: serve via Server‑Sent Events or streamable HTTP.
-- Flexible config: supports `stdio`, `sse`, and `streamable-http` client types.
+## How it works
 
-## Documentation
-
-- Configuration: [docs/configuration.md](docs/CONFIGURATION.md)
-- Usage: [docs/usage.md](docs/USAGE.md)
-- Deployment: [docs/deployment.md](docs/DEPLOYMENT.md)
-- Claude config converter: https://tbxark.github.io/mcp-proxy
-
-## Quick Start
-
-### Build from source
-
-```bash
-git clone https://github.com/tbxark/mcp-proxy.git
-cd mcp-proxy
-make build
-./build/mcp-proxy --config path/to/config.json
+```
+nanobot ──SSE──▶ mcpeto (mutex tool) ──▶ backend MCP servers
+                      │
+                      ├── discover: BM25 search over all handlers
+                      ├── dispatch: enqueue job, return immediately
+                      ├── status:   poll job, get summary + chunk_id
+                      ├── fetch:    retrieve full output by chunk_id
+                      ├── alias:    register shortcuts
+                      └── reload:   refresh handler list
 ```
 
-### Install via Go
+Backends are registered at startup via config or at runtime via the
+`/mgmt/servers` CRUD API. Tools are namespaced as `{server_name}.{tool_name}`.
+
+## Quick start
 
 ```bash
-go install github.com/tbxark/mcp-proxy@latest
+git clone https://github.com/soscpd/mcpeto.git
+cd mcpeto
+make build
+./build/mcpeto --config config.json
+```
+
+### Go install
+
+```bash
+go install github.com/soscpd/mcpeto@latest
+mcpeto --config config.json
 ```
 
 ### Docker
 
-The image includes support for launching MCP servers via `npx` and `uvx`.
-
 ```bash
-docker run -d -p 9090:9090 -v /path/to/config.json:/config/config.json ghcr.io/tbxark/mcp-proxy:latest
-# or provide a remote config
-docker run -d -p 9090:9090 ghcr.io/tbxark/mcp-proxy:latest --config https://example.com/config.json
+docker run -v $(pwd)/config.json:/config/config.json \
+  registry.skull.everyof.net/mcpeto:latest
 ```
 
-More deployment options (including docker‑compose) are in [docs/deployment.md](docs/DEPLOYMENT.md).
+### Helm
+
+```bash
+helm install mcpeto charts/mcpeto
+```
+
+## Management API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/mgmt/servers` | Register a backend MCP server |
+| `DELETE` | `/mgmt/servers/{name}` | Deregister a server |
+| `GET` | `/mgmt/servers` | List registered servers |
+| `GET` | `/mgmt/metrics` | Prometheus metrics |
+| `GET` | `/mgmt/metrics?format=json` | JSON metrics |
+
+## Metrics
+
+Key signals for autoscaling:
+
+- `mcpeto_jobs_active` — queued + running jobs
+- `mcpeto_jobs_per_session_peak` — highest active count per session
+- `mcpeto_jobs_per_session_limit` — configured cap (default 64)
 
 ## Configuration
 
-See full configuration reference and examples in [docs/configuration.md](docs/CONFIGURATION.md).
-An online Claude config converter is available at: https://tbxark.github.io/mcp-proxy
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the config file format.
 
+See [docs/dynamic-registration.md](docs/dynamic-registration.md) for the runtime
+registration API.
 
-## Usage
-
-Command‑line flags, endpoints, and auth examples are documented in [docs/usage.md](docs/USAGE.md).
-
-## Thanks
-
-- This project was inspired by the [adamwattis/mcp-proxy-server](https://github.com/adamwattis/mcp-proxy-server) project
-- If you have any questions about deployment, you can refer to  [《在 Docker 沙箱中运行 MCP Server》](https://miantiao.me/posts/guide-to-running-mcp-server-in-a-sandbox/)([@ccbikai](https://github.com/ccbikai))
+See [docs/system-prompt.md](docs/system-prompt.md) for the model system prompt.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+[MIT](LICENSE)
+
+---
+
+*Originally forked from [TBXark/mcp-proxy](https://github.com/TBXark/mcp-proxy).*
